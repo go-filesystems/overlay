@@ -6,6 +6,7 @@ package overlay
 import (
 	"bytes"
 	"errors"
+	filesystem "github.com/go-filesystems/interface"
 	"io"
 	"os"
 	"path"
@@ -20,8 +21,19 @@ type Builder interface {
 	// AddDir records a directory. A format with no directory entries may
 	// ignore it.
 	AddDir(name string, perm os.FileMode) error
-	// AddFile records a file and reads its contents from r.
-	AddFile(name string, perm os.FileMode, r io.Reader) error
+	// AddFile records a file of exactly size bytes and reads them from r.
+	//
+	// The size is given rather than discovered because tar cannot be written
+	// without it: an entry's length goes in its header, BEFORE its bytes. A
+	// builder handed only a reader would have to spool the whole entry to learn
+	// how long it is -- copying a 1.2 GiB video to a temporary file to count it,
+	// when the caller knew the answer -- which is the cost this whole layer
+	// exists to avoid. A format that does not need the size ignores it.
+	//
+	// r delivers exactly size bytes. A builder may rely on that; a caller that
+	// breaks it produces an archive whose header disagrees with its data, which
+	// is the one failure every reader reports as corruption.
+	AddFile(name string, perm os.FileMode, size int64, r io.Reader) error
 }
 
 // Seal hands the merged view to a builder, once.
@@ -74,29 +86,38 @@ func (o *Overlay) addFile(b Builder, e sealEntry) error {
 			return err
 		}
 		defer f.Close()
-		return b.AddFile(e.path, e.mode, f)
+		st, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		return b.AddFile(e.path, e.mode, st.Size(), f)
 	}
 	// From the base. A handle is asked for first so a large entry is streamed
 	// rather than held: ReadFile would put the whole thing in memory, which for
 	// an archive of videos is the thing to avoid.
-	if op, ok := o.base.(interface {
-		OpenFile(string) (interface {
-			io.ReaderAt
-			io.Closer
-			Size() int64
-		}, error)
-	}); ok {
+	//
+	// ⛔ This asks for filesystem.Opener BY NAME, and the name is the whole
+	// point. It used to assert an anonymous interface of the same SHAPE --
+	// OpenFile(string) (interface{io.ReaderAt; io.Closer; Size() int64}, error)
+	// -- which no driver in this ecosystem can satisfy: Go requires a method's
+	// signature to match exactly, and filesystem.File is a different TYPE from
+	// an anonymous interface with filesystem.File's methods. Every driver
+	// returns filesystem.File, so the assertion always failed and this branch
+	// was unreachable. Nothing broke; every seal simply read whole files into
+	// memory through the fallback below, which is the one thing the comment
+	// above says not to do.
+	if op, ok := o.base.(filesystem.Opener); ok {
 		h, err := op.OpenFile(e.path)
 		if err == nil {
 			defer h.Close()
-			return b.AddFile(e.path, e.mode, io.NewSectionReader(h, 0, h.Size()))
+			return b.AddFile(e.path, e.mode, h.Size(), io.NewSectionReader(h, 0, h.Size()))
 		}
 	}
 	data, err := o.base.ReadFile(e.path)
 	if err != nil {
 		return err
 	}
-	return b.AddFile(e.path, e.mode, bytes.NewReader(data))
+	return b.AddFile(e.path, e.mode, int64(len(data)), bytes.NewReader(data))
 }
 
 // walk produces the merged view, sorted so a parent precedes its children.
