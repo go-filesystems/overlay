@@ -4,8 +4,11 @@
 package overlay
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -89,10 +92,13 @@ func (b *fakeBase) Rename(string, string) error                 { return errors.
 
 // recorder is a Builder that remembers what it was handed.
 type recorder struct {
-	files   map[string]string
-	dirs    []string
-	failOn  string // the entry to fail at, for the interruption test
-	written int
+	// sizeErrs records entries whose declared size did not match the bytes
+	// delivered, keyed by name. Empty is the only acceptable state.
+	sizeErrs map[string]string
+	files    map[string]string
+	dirs     []string
+	failOn   string // the entry to fail at, for the interruption test
+	written  int
 }
 
 func (r *recorder) AddDir(name string, _ os.FileMode) error {
@@ -100,13 +106,24 @@ func (r *recorder) AddDir(name string, _ os.FileMode) error {
 	return nil
 }
 
-func (r *recorder) AddFile(name string, _ os.FileMode, src io.Reader) error {
+func (r *recorder) AddFile(name string, _ os.FileMode, size int64, src io.Reader) error {
 	if r.failOn != "" && name == r.failOn {
 		return errors.New("the disk filled up")
 	}
 	b, err := io.ReadAll(src)
 	if err != nil {
 		return err
+	}
+	// The contract says r delivers exactly size bytes, and a builder for tar
+	// RELIES on that: the length goes in the header before the data. So the
+	// double checks it on every entry rather than accepting the number.
+	// Otherwise the size could be wrong on every path here and nothing would
+	// notice until an archive came out corrupt.
+	if size != int64(len(b)) {
+		if r.sizeErrs == nil {
+			r.sizeErrs = map[string]string{}
+		}
+		r.sizeErrs[name] = fmt.Sprintf("declared %d, delivered %d", size, len(b))
 	}
 	if r.files == nil {
 		r.files = map[string]string{}
@@ -211,6 +228,9 @@ func TestOnlyWhatChangedIsCopied(t *testing.T) {
 	if err := o.Seal(rec); err != nil {
 		t.Fatal(err)
 	}
+	if len(rec.sizeErrs) != 0 {
+		t.Errorf("Seal declared sizes that did not match the bytes it delivered: %v", rec.sizeErrs)
+	}
 	if rec.files["big1.bin"] != big {
 		t.Error("an untouched entry did not reach the builder from the base")
 	}
@@ -284,6 +304,9 @@ func TestTheUpperLayerWinsAndADeletionShadows(t *testing.T) {
 	rec := &recorder{}
 	if err := o.Seal(rec); err != nil {
 		t.Fatal(err)
+	}
+	if len(rec.sizeErrs) != 0 {
+		t.Errorf("Seal declared sizes that did not match the bytes it delivered: %v", rec.sizeErrs)
 	}
 	if _, ok := rec.files["gone.txt"]; ok {
 		t.Error("a deleted entry was sealed into the new archive")
@@ -463,5 +486,71 @@ func TestTheRestOfTheContractAnswers(t *testing.T) {
 	}
 	if err := o.MkDir("/", 0); err == nil {
 		t.Error("a directory with no name was made")
+	}
+}
+
+// openingBase is a base that hands out HANDLES, which fakeBase does not.
+//
+// The branch in addFile that asks for one exists to STREAM a large entry
+// instead of reading it whole: "ReadFile would put the whole thing in memory,
+// which for an archive of videos is the thing to avoid". Nothing exercised it,
+// which an ablation showed -- zeroing the size on that path left the suite
+// green, because every test went through the ReadFile fallback beside it.
+type openingBase struct {
+	fakeBase
+	opened []string // names a handle was asked for, so the path is PROVABLE
+}
+
+type memHandle struct {
+	*bytes.Reader
+	size int64
+}
+
+func (h memHandle) Close() error { return nil }
+func (h memHandle) Size() int64  { return h.size }
+
+func (b *openingBase) OpenFile(p string) (filesystem.File, error) {
+	body, ok := b.files[p]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	b.opened = append(b.opened, p)
+	return memHandle{Reader: bytes.NewReader([]byte(body)), size: int64(len(body))}, nil
+}
+
+// TestSealStreamsFromABaseThatHandsOutHandles.
+//
+// Two things are asserted, and the second is what makes the first mean
+// anything: the bytes arrive, AND the handle path was the one taken. Without
+// the second, the ReadFile fallback satisfies the test and the streaming branch
+// stays unexercised -- which is exactly how it got here.
+func TestSealStreamsFromABaseThatHandsOutHandles(t *testing.T) {
+	base := &openingBase{fakeBase: fakeBase{files: map[string]string{
+		"big.bin":       strings.Repeat("x", 5000),
+		"small.txt":     "little",
+		"deep/other.md": "# and one in a directory",
+	}}}
+	o, err := New(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	rec := &recorder{}
+	if err := o.Seal(rec); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if len(rec.sizeErrs) != 0 {
+		t.Errorf("Seal declared sizes that did not match the bytes it delivered: %v", rec.sizeErrs)
+	}
+	if len(base.opened) != len(base.files) {
+		t.Errorf("handles asked for %v, want one per file %v: the ReadFile "+
+			"fallback was taken and the streaming branch is still untested",
+			base.opened, base.files)
+	}
+	for name, want := range base.files {
+		if rec.files[name] != want {
+			t.Errorf("%s: %d bytes, want %d", name, len(rec.files[name]), len(want))
+		}
 	}
 }
