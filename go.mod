@@ -2,4 +2,4 @@ module github.com/go-filesystems/overlay
 
 go 1.27.1
 
-require github.com/go-filesystems/interface v0.4.0
+require github.com/go-filesystems/interface v0.5.0
