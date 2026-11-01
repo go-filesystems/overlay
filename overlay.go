@@ -35,6 +35,7 @@ package overlay
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -58,7 +59,43 @@ var (
 	ErrClosed = errors.New("overlay: closed")
 	// ErrExists is returned by MkDir for a path already taken.
 	ErrExists = errors.New("overlay: already exists")
+	// ErrTooLarge is returned, wrapped with the figure that was exceeded, when a
+	// bound of [Limits] is hit: a base that lists more entries or nests deeper
+	// than the limits allow, or a write that would take the spool past
+	// MaxSpool. The work stops before the memory or disk is spent.
+	ErrTooLarge = errors.New("overlay: limit exceeded")
 )
+
+// Defaults of [Limits].
+const (
+	// DefaultMaxEntries is the most entries Seal walks in the base. Every entry
+	// is held in memory (about 200 bytes) until the seal ends, and a base that
+	// lists a directory inside itself yields entries without end.
+	DefaultMaxEntries = 4 << 20
+	// DefaultMaxDepth is the deepest directory nesting Seal descends: PATH_MAX
+	// (4096 on Linux) holds at most 2048 one-letter components.
+	DefaultMaxDepth = 2048
+)
+
+// Limits bounds what an Overlay spends on its base and its spool. A zero field
+// takes its default, except MaxSpool, where zero means unlimited.
+type Limits struct {
+	// MaxEntries bounds the entries Seal walks in the base. Default
+	// DefaultMaxEntries.
+	MaxEntries int
+	// MaxDepth bounds the directory nesting Seal descends. Default
+	// DefaultMaxDepth.
+	MaxDepth int
+	// MaxSpool bounds the bytes of live working copies in the spool; a write
+	// that would exceed it fails with ErrTooLarge before touching the disk. Zero
+	// is unlimited: the spool is as large as the changes the caller makes.
+	MaxSpool int64
+}
+
+// WithLimits sets the bounds. See [Limits].
+func WithLimits(l Limits) Option {
+	return func(o *Overlay) { o.lim = l }
+}
 
 // kind is what the upper layer remembers about a path.
 type kind int
@@ -90,6 +127,9 @@ type Overlay struct {
 	seq      int
 	closed   bool
 	ownSpool bool
+
+	lim        Limits
+	spoolBytes int64 // bytes of live working copies
 }
 
 // Option configures an Overlay.
@@ -109,6 +149,12 @@ func New(base filesystem.Filesystem, opts ...Option) (*Overlay, error) {
 	o := &Overlay{base: base, changes: map[string]*change{}}
 	for _, opt := range opts {
 		opt(o)
+	}
+	if o.lim.MaxEntries == 0 {
+		o.lim.MaxEntries = DefaultMaxEntries
+	}
+	if o.lim.MaxDepth == 0 {
+		o.lim.MaxDepth = DefaultMaxDepth
 	}
 	if o.spool == "" {
 		dir, err := os.MkdirTemp("", "overlay-spool-")
@@ -225,6 +271,14 @@ func (o *Overlay) WriteFile(p string, data []byte, perm os.FileMode) error {
 	if cp == "" || cp == "." {
 		return errors.New("overlay: a file with no name")
 	}
+	// A rewrite replaces the working copy it finds: count only the difference.
+	live := o.spoolBytes + int64(len(data))
+	if old, ok := o.changes[cp]; ok && old.kind == kindFile {
+		live -= old.size
+	}
+	if o.lim.MaxSpool > 0 && live > o.lim.MaxSpool {
+		return fmt.Errorf("%w: spool would hold %d bytes, more than %d", ErrTooLarge, live, o.lim.MaxSpool)
+	}
 	o.seq++
 	name := path.Join(o.spool, "e"+itoa(o.seq))
 	if err := os.WriteFile(name, data, 0o600); err != nil {
@@ -233,8 +287,21 @@ func (o *Overlay) WriteFile(p string, data []byte, perm os.FileMode) error {
 	if perm == 0 {
 		perm = 0o644
 	}
+	o.release(o.changes[cp])
 	o.changes[cp] = &change{kind: kindFile, spool: name, mode: perm, size: int64(len(data))}
+	o.spoolBytes += int64(len(data))
 	return nil
+}
+
+// release frees the working copy c holds, if any. Every WriteFile used to leave
+// the copy it replaced in the spool, and a delete left the copy of the file it
+// deleted: 100 rewrites of one 1 MiB file held 100 MiB until Close.
+func (o *Overlay) release(c *change) {
+	if c == nil || c.kind != kindFile {
+		return
+	}
+	os.Remove(c.spool)
+	o.spoolBytes -= c.size
 }
 
 // MkDir records a directory. Nothing is created in the base, which has no idea
@@ -283,6 +350,7 @@ func (o *Overlay) DeleteFile(p string) error {
 			return ErrNotFound
 		}
 	}
+	o.release(o.changes[cp])
 	o.changes[cp] = &change{kind: kindGone}
 	return nil
 }
@@ -298,6 +366,7 @@ func (o *Overlay) DeleteDir(p string) error {
 	if _, gone := o.lookup(cp); gone {
 		return ErrNotFound
 	}
+	o.release(o.changes[cp])
 	o.changes[cp] = &change{kind: kindGone}
 	return nil
 }

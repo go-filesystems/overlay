@@ -6,12 +6,14 @@ package overlay
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	filesystem "github.com/go-filesystems/interface"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Builder is what a format offers for authoring one: iso9660's Builder, a zip
@@ -125,8 +127,19 @@ func (o *Overlay) walk() ([]sealEntry, error) {
 	seen := map[string]sealEntry{}
 
 	// The base, minus whatever is shadowed.
-	var descend func(dir string) error
-	descend = func(dir string) error {
+	//
+	// The base is untrusted: it is an archive or an image somebody handed us. A
+	// directory that lists itself (hard-linked directories in a crafted image),
+	// or an entry named ".." that Join folds back onto its parent, made this walk
+	// recurse and fill `seen` without end -- a stack overflow, which Go cannot
+	// recover. Depth and the number of entries are both bounded, and "." / ".."
+	// are not entries.
+	var descend func(dir string, depth int) error
+	count := 0
+	descend = func(dir string, depth int) error {
+		if depth > o.lim.MaxDepth {
+			return fmt.Errorf("%w: base nests deeper than %d directories", ErrTooLarge, o.lim.MaxDepth)
+		}
 		entries, err := o.base.ListDir(dir)
 		if err != nil {
 			// A base that cannot list a directory it named is a base problem,
@@ -135,7 +148,17 @@ func (o *Overlay) walk() ([]sealEntry, error) {
 			return err
 		}
 		for _, e := range entries {
-			p := path.Join(dir, e.Name())
+			name := e.Name()
+			if name == "." || name == ".." {
+				continue // a reference to a directory already walked, not an entry
+			}
+			if name == "" || strings.Contains(name, "/") {
+				return fmt.Errorf("overlay: base lists an entry with the invalid name %q under %q", name, dir)
+			}
+			if count++; count > o.lim.MaxEntries {
+				return fmt.Errorf("%w: base holds more than %d entries", ErrTooLarge, o.lim.MaxEntries)
+			}
+			p := path.Join(dir, name)
 			if _, gone := o.lookup(p); gone {
 				continue
 			}
@@ -151,14 +174,14 @@ func (o *Overlay) walk() ([]sealEntry, error) {
 			}
 			seen[p] = sealEntry{path: p, dir: isDir, mode: mode}
 			if isDir {
-				if err := descend(p); err != nil {
+				if err := descend(p, depth+1); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	if err := descend(""); err != nil {
+	if err := descend("", 0); err != nil {
 		return nil, err
 	}
 

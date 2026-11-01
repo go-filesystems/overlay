@@ -86,6 +86,27 @@ purpose and loudly**:
 `WithSpool(dir)` puts the working copies somewhere the caller owns, and `Close`
 then leaves that directory alone.
 
+## Untrusted base, bounded spool
+
+The base is an archive or an image somebody handed over, so `Seal` does not trust
+its directory listings. `WithLimits(overlay.Limits{...})` sets the bounds; a bound
+that is hit returns an error wrapping `ErrTooLarge`, before the memory is spent:
+
+| Bound | Default | Why |
+| --- | --- | --- |
+| entries `Seal` walks in the base (`MaxEntries`) | 4 Mi | every entry is held in memory (about 200 bytes) until the seal ends |
+| directory nesting (`MaxDepth`) | 2048 | `PATH_MAX` (4096) holds at most 2048 one-letter components |
+| live working copies in the spool (`MaxSpool`) | unlimited | set it to cap the disk a writer can take |
+
+A base that lists a directory inside itself (hard-linked directories in a
+crafted image) used to make `Seal` recurse and grow without end: it had not
+returned after 200 s. `.` and `..` in a listing are not entries and are skipped;
+an empty name or a name containing `/` is refused. `WriteFile` used to leave the
+copy it replaced in the spool, and `DeleteFile` / `DeleteDir` the copy of what
+they deleted: 100 rewrites of one 1 MiB file held 100 MiB until `Close`. They
+are now released, and the bytes counted equal the live copies (`FuzzSpoolAccounting`
+checks that; `FuzzSealBase` drives `Seal` over hostile listings).
+
 ## What the upper layer does not do
 
 | | |
